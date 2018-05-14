@@ -23,8 +23,7 @@ Running this program might be slow if you have lots of conversations as it respe
 ### 1. Install the script with:
 
 ```bash
-composer config -g repositories.helpscout-exporter vcs https://github.com/guenard/helpscout-exporter.git
-composer require -g guenard/helpscout-exporter
+composer global require guenard/helpscout-exporter
 ```
 
 **Notes:**
