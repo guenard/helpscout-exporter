@@ -24,7 +24,7 @@ class helpscoutExporter {
 	/**
 	* @var str Help Scout exporter versionning
 	*/
-	const VERSION = '1.2';
+	const VERSION = '1.2.1';
 
 	/**
 	* @var str Base URL (domain + path) for the Help Scout API
