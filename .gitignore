@@ -1,0 +1,4 @@
+*.json
+!composer.json
+/vendor
+*.log

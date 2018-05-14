@@ -1,0 +1,512 @@
+#!/usr/bin/php
+<?php
+
+/**
+* Help Scout exporter
+*
+* This small program lets you download your history of Help Scout
+* email threads & conversations, either for backup purposes
+* or because you are exporting your data archive to another platform.
+* Help Scout is an email-based customer support / help desk service.
+*
+* @author Antoine Guénard
+*/
+
+if (file_exists(__DIR__ . '/../../autoload.php')) {
+	require __DIR__  . '/../../autoload.php';
+}
+else {
+	require __DIR__ . '/vendor/autoload.php';
+}
+
+class helpscoutExporter {
+
+	/**
+	* @var str Help Scout exporter versionning
+	*/
+	const VERSION = '1.2';
+
+	/**
+	* @var str Base URL (domain + path) for the Help Scout API
+	*/
+	const API_BASE_URI = 'https://api.helpscout.net/v1/';
+
+	/**
+	* @var int Maximum number of retries on API request error
+	*/
+	const API_MAX_RETRY = 3;
+
+	/**
+	* @var int Time to wait in seconds before next retry
+	*/
+	const API_RETRY_WAITING = 5;
+
+	/**
+	* @var str Logging output format
+	*/
+	const LOG_FORMAT = "[%datetime%] %level_name%: %message% %context%";
+
+	/**
+	* @var mixed $logger Monolog instance
+	*/
+	private $logger;
+
+	/**
+	* @var \GuzzleHttp\Client $http_client Guzzle client instance
+	*/
+	private $http_client;
+
+	/**
+	* @var array $conversations Stores all unwritten mailboxes' conversations
+	*/
+	private $conversations = [];
+
+	/**
+	* @var string $output_directory All output files will be written to this directory
+	*/
+	private $output_directory = null;
+
+	/**
+	* @param string $api_key Help Scout API Key
+	* @param string $output_directory Write all output files to this directory
+	*/
+	public function __construct($api_key, $output_directory) {
+
+		// attach signal handler callbacks
+
+		declare(ticks = 1);
+
+		pcntl_signal(SIGINT, [$this, 'signal_handler']);
+		pcntl_signal(SIGQUIT, [$this, 'signal_handler']);
+		pcntl_signal(SIGTERM, [$this, 'signal_handler']);
+		pcntl_signal(SIGHUP, [$this, 'signal_handler']);
+
+		// setup the Monolog logger
+
+		$this->logger = new \Monolog\Logger('log');
+		$log_handler = new \Monolog\Handler\StreamHandler('php://stdout');
+
+		// if stdout is the terminal, colorize log lines
+		if(posix_isatty(STDOUT)) {
+			$log_line_formatter = new \Bramus\Monolog\Formatter\ColoredLineFormatter(null, self::LOG_FORMAT, null, false, true);
+		}
+		else {
+			$log_line_formatter = new \Monolog\Formatter\LineFormatter(self::LOG_FORMAT . "\n", null, false, true);
+		}
+
+		$log_handler->setFormatter($log_line_formatter);
+		$this->logger->pushHandler($log_handler);
+
+		// setup the output directory
+
+		if(file_exists($output_directory)) {
+			$output_directory = realpath($output_directory);
+			if(!is_dir($output_directory)) {
+				$this->logger->errpr('invalid config, supplied output directory exists and is not a directory', [
+					'path' => $output_directory
+				]);
+				return;
+			}
+			elseif(!is_writable($output_directory)) {
+				$this->logger->error('invalid config, supplied output directory exists and is not writable', [
+					'path' => $output_directory
+				]);
+				return;
+			}
+		}
+		elseif(!@mkdir($output_directory, 0777, true)) {
+			$this->logger->error('invalid config, failed to create output directory', [
+				'path' => realpath(dirname($output_directory) . DIRECTORY_SEPARATOR . basename($output_directory))
+			]);
+			return;
+		}
+		else {
+			$output_directory = realpath($output_directory);
+		}
+
+		$this->logger->debug(sprintf('output files will be written under `%s`', $output_directory));
+		$this->output_directory = $output_directory;
+
+		// setup the Guzzle http client
+
+		if(is_null($api_key)) {
+			$this->logger->error('invalid config, `HELPSCOUT_API_KEY` environment variable is missing');
+			return;
+		}
+		else {
+			$redacted_api_key = substr($api_key, 0, 4) . str_pad('', (mb_strlen($api_key) - 8), '*') . substr($api_key, -4);
+			$this->logger->debug(sprintf("configures with API key `%s`", $redacted_api_key));
+			$this->http_client = new \GuzzleHttp\Client([
+				'base_uri' => self::API_BASE_URI,
+				'http_errors' => false,
+				'connect_timeout' => 5,
+				'timeout' => 15,
+				'auth' => [$api_key, 'X'] // fake password needed by their API
+			]);
+		}
+	}
+
+	/**
+	* Callback method that will handle system signals properly
+	* 
+	* @param int $signal Signal number
+	*/
+	public function signal_handler($signal)
+	{
+		switch ($signal) {
+			case SIGINT:
+				$this->logger->warning("received SIGINT");
+				break;
+			case SIGQUIT:
+				$this->logger->warning("received SIGQUIT");
+				break;
+			case SIGTERM:
+				$this->logger->warning("received SIGTERM");
+				break;
+			case SIGHUP:
+				$this->logger->warning("received SIGHUP");
+				break;
+			default:
+				$this->logger->warning("received another termination signal");
+		}
+
+		// write downloaded conversations before stopping
+		if(count($this->conversations) > 0) {
+			$this->write_conversations(true);
+		}
+
+		$this->logger->debug("stops exporter script");
+
+		exit(0);
+	}
+
+	/**
+	* Send an HTTP request to the Help Scout API
+	* 
+	* @param string $route Path of the API HTTP endpoint
+	* @return \Guzzle\Http\Message\Response Guzzle response object.
+	*/
+	private function api_request($route) {
+
+		$retry = 0;
+		
+		while(true) {
+
+			try {
+				$response = $this->http_client->get($route);
+			}
+			catch(GuzzleHttp\Exception\ConnectException $e) {
+				// temporary connect error, will retry
+				if($retry < self::API_MAX_RETRY) {
+					$this->logger->warning(sprintf("API connect exception, waits for %d seconds (%d / 3)", self::API_RETRY_WAITING, ($retry + 1)), [
+						"route" => $route,
+						"exception" => $e->getMessage()
+					]);
+					$retry++;
+					sleep(self::API_RETRY_WAITING);
+					continue;
+				}
+				else {
+					// too many connect errors
+					$this->logger->error("API connect exception, stops exporter script", [
+						"route" => $route,
+						"exception" => $e->getMessage()
+					]);
+					return;
+				}
+			}
+			catch(Exception $e) {
+				// unknown error
+				$this->logger->error("API unknown exception, stops exporter script", [
+					"route" => $route,
+					"exception" => $e->getMessage()
+				]);
+				return;
+			}
+
+			if($response->getStatusCode() === 429) {
+				// api rate limit reached, will retry after few seconds
+				$time_to_wait = ($response->hasHeader('Retry-After') ? ((int) $response->getHeader('Retry-After')[0] + 1) : 10);
+				$this->logger->warning(sprintf("API reached rate limit, waits for %d seconds", $time_to_wait), [
+					"http_code" => $response->getStatusCode(), 
+					"reason" => $response->getReasonPhrase(), 
+					"route" => $route
+				]);
+				sleep($time_to_wait);
+				continue;
+			}
+
+			break;
+		}
+
+		if($response->getStatusCode() === 401) {
+			$this->logger->error("API request unauthorized, please check your API key", [
+				"http_code" => $response->getStatusCode(), 
+				"reason" => $response->getReasonPhrase(), 
+				"route" => $route
+			]);
+		}
+		elseif($response->getStatusCode() !== 200) {
+			$this->logger->error("API request failed", [
+				"http_code" => $response->getStatusCode(), 
+				"reason" => $response->getReasonPhrase(), 
+				"route" => $route
+			]);
+		}
+
+		return $response;
+	}
+
+	/**
+	* Download mailboxes from Help Scout /mailboxes.json API endpoint
+	* 
+	* @param int $page (optional) Page number of the API request (starts at 1)
+	* @return stdClass|null List of downloaded mailboxes with next page id.
+	*/
+	private function get_mailboxes($page = 1) {
+
+		$response = $this->api_request('mailboxes.json?page=' . $page);
+		if(is_null($response) || $response->getStatusCode() !== 200) return;
+
+		$json = json_decode($response->getBody());
+
+		$this->logger->debug(sprintf("API returned %d mailbox(es)", $json->count));
+		$mailboxes = [];
+
+		foreach($json->items as $mailbox) {
+			$mailboxes[] = (object) [
+				'id' => $mailbox->id,
+				'slug' => $mailbox->slug,
+				'email' => $mailbox->email,
+				'name' => $mailbox->name
+			];
+		}
+
+		return (object) [
+			'items' => $mailboxes,
+			'next_page' => ($json->page !== $json->pages ? ($json->page + 1) : null)
+		];
+	}
+
+	/**
+	* Download conversations from Help Scout /mailboxes/conversations.json API endpoint
+	* 
+	* @param int $mailbox_id ID of the conversations' mailbox
+	* @param int $page (optional) Page number of the API request (starts at 1)
+	* @return stdClass|null List of downloaded conversations with next page id.
+	*/
+	private function get_conversations($mailbox_id, $page = 1) {
+
+		$response = $this->api_request('mailboxes/' . $mailbox_id . '/conversations.json?page=' . $page );
+		if(is_null($response) || $response->getStatusCode() !== 200) return;
+
+		$json = json_decode($response->getBody());
+
+		$conversations = [];
+
+		foreach($json->items as $conversation) {
+			// email threads requires a specific API request to the /conversations endpoint
+			$conversation->threads = $this->get_conversation_threads($conversation->id);
+			$conversations[] = $conversation;
+		}
+
+		return (object) [
+			'items' => $conversations,
+			'next_page' => ($json->page !== $json->pages ? ($json->page + 1) : null)
+		];	
+	}
+
+	/**
+	* Transform Help Scout e-mail HTML body into basic markdown
+	* 
+	* @param string $html E-mail HTML body to convert
+	* @return string E-mail body converted into Markdown.
+	*/
+	function html_to_markdown($html) {
+
+		$html = preg_replace('/<img[^>]*?src="([^"]+)".*?>/m', "\n![Image]($1)\n", $html);
+		$html = preg_replace('/<a[^>]*?href="([^"]+)".*?>(.*?)<\/a>/m', "[$2]($1)", $html);
+		$html = preg_replace('/<br[^>]*>/m', "\n\n", $html);
+		$html = preg_replace("/\n{2,}/m", "\n\n", strip_tags($html));
+		$html = preg_replace("/ +/m", " ", $html);
+
+		return trim($html);
+	}
+
+	/**
+	* Download conversations threads from Help Scout /conversations API endpoint
+	* 
+	* @param int $conversation_id ID of the conversation
+	* @return stdClass Conversation sub-threads.
+	*/
+	function get_conversation_threads($conversation_id) {
+
+		$response = $this->api_request('conversations/' . $conversation_id . '.json');
+
+		if(is_null($response) || $response->getStatusCode() !== 200) return;
+
+		$threads = json_decode($response->getBody())->item->threads;
+
+		/*
+		foreach($threads as &$thread) {
+			$thread->body = html_to_markdown($thread->body);
+		}
+		*/
+
+		return $threads;
+	}
+
+	/**
+	* Count downloaded & non-written conversations
+	* 
+	* @return int Number of downloaded & non-written conversations
+	*/
+	function count_conversations() {
+
+		if(count($this->conversations) === 0) return 0;
+
+		// count conversations under each mailboxes
+		return (int) array_sum(array_map("count", $this->conversations));
+	}
+
+	/**
+	* Write downloaded conversations into output files
+	* 
+	* @param bool $close_file (optional) Close the file after writing conversations or not
+	*/
+	function write_conversations($close_file = false) {
+
+		$nb_conversations = $this->count_conversations();
+		
+		foreach($this->conversations as $mailbox_id => $mailbox_conversations) {
+
+			$nb_mailbox_conversations = count($mailbox_conversations);
+
+			$filename = $this->output_directory . DIRECTORY_SEPARATOR . 'conversations_' . $mailbox_id . '.json';
+
+			if(!file_exists($filename)) {
+				$file = fopen($filename, 'w+');
+				fwrite($file, "[\n"); // starts JSON array notation
+				$this->logger->debug(sprintf("creates output file '%s'", basename($filename)));
+			}
+			else {
+				$file = fopen($filename, 'a+');
+			}
+
+			for ($i = 0; $i < $nb_mailbox_conversations; $i++) {
+				// write conversation JSON on a new line
+				fwrite($file, json_encode($mailbox_conversations[$i]) . ",\n");
+			}
+
+			$this->conversations[$mailbox_id] = [];
+
+			// close file
+			if($close_file === true) {
+
+				unset($this->conversations[$mailbox_id]);
+
+				ftruncate($file, fstat($file)['size'] - 2); // removes last 2 chars (,\n)
+				fseek($file, 0, SEEK_END);
+				fwrite($file, "\n]"); // ends JSON array notation
+				$this->logger->debug(sprintf("closes output file '%s'", basename($filename)));
+			}
+			
+			fclose($file);
+		}
+
+		if($nb_conversations > 0) {
+			$this->logger->debug(sprintf("writes %d new conversation(s) to output file(s)", $nb_conversations));
+		}
+	}
+
+	/**
+	* Main script method that runs the mailboxes + conversations export
+	*/
+	public function run() {
+
+		// Guzzle client should be initiated in the constructor
+		// do nothing if it isn't available
+		if(is_null($this->http_client)) {
+			return;
+		}
+
+		$this->logger->debug("starts exporter script");
+
+		$mailboxes = [];
+		$page = 1;
+
+		// get mailboxes list
+		while(!is_null($page))
+		{
+			$response = $this->get_mailboxes($page);
+			if(!$response) break;
+			$mailboxes = array_merge($mailboxes, $response->items);
+			$page = $response->next_page;
+		}
+
+		file_put_contents($this->output_directory . DIRECTORY_SEPARATOR . 'mailboxes.json', json_encode($mailboxes));
+
+		$this->logger->debug(sprintf("adds %d mailbox(es) to output file", count($mailboxes)));
+
+		$page = 1;
+
+		// get conversations list
+		foreach($mailboxes as $mailbox) {
+
+			$this->logger->debug(sprintf("starts getting conversations for %s", $mailbox->email));
+
+			while(!is_null($page)) {
+				$response = $this->get_conversations($mailbox->id, $page);
+				if(!$response) break;
+
+				$this->logger->debug(sprintf("API returned %d new conversation(s)", count($response->items)));
+
+				if(!isset($conversations[$mailbox->id])) {
+					$this->conversations[$mailbox->id] = [];
+				}
+				
+				$this->conversations[$mailbox->id] = array_merge($this->conversations[$mailbox->id], $response->items);
+				$page = $response->next_page;
+
+				// flush conversations
+				$this->write_conversations();
+			}
+
+			$this->write_conversations(true);
+
+			$page = 1;
+
+		}
+
+		$this->logger->debug("stops exporter script");
+
+	}
+
+}
+
+// available cli options (-o, -h and --help)
+$options = (object) getopt("o:h", ["help"]);
+
+// displays cli help (usage/options) if requested
+// or if -o required parameter is missing
+if(isset($options->h) || isset($options->help) || !isset($options->o) || empty($options->o)) {
+
+	$script_name = pathinfo(__FILE__, PATHINFO_FILENAME);
+	echo "Usage:\n";
+	echo "  " . $script_name . " -o DIRECTORY\n\n";
+	echo "Options:\n";
+	echo "  -h, --help\tDisplay this help message\n";
+	echo "  -o=DIRECTORY\tWrite all output files into DIRECTORY\n";
+
+}
+else {
+
+	// get the Help Scout API Key from an environment variable
+	$helpscout_api_key = (getenv('HELPSCOUT_API_KEY') ?: null);
+
+	// instantiate and run the exporter
+	(new helpscoutExporter($helpscout_api_key, $options->o))->run();
+
+}
+
+exit(0);
