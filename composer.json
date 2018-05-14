@@ -1,6 +1,7 @@
 {
 	"name": "guenard/helpscout-exporter",
 	"description": "Export your Help Scout conversations",
+	"licence": "MIT",
 	"authors": [
 		{"name": "Antoine Guénard"}
 	],
