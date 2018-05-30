@@ -102,7 +102,7 @@ class helpscoutExporter {
 		if(file_exists($output_directory)) {
 			$output_directory = realpath($output_directory);
 			if(!is_dir($output_directory)) {
-				$this->logger->errpr('invalid config, supplied output directory exists and is not a directory', [
+				$this->logger->error('invalid config, supplied output directory exists and is not a directory', [
 					'path' => $output_directory
 				]);
 				return;
