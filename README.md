@@ -1,3 +1,7 @@
+This project has been deprecated following the shutdown of Help scout Mailbox API 1.0.
+
+[![No Maintenance Intended](http://unmaintained.tech/badge.svg)](http://unmaintained.tech/)
+
 # Help Scout exporter
 
 This small program lets you **download your history of [Help Scout](https://helpscout.net) email threads & conversations**, either for backup purposes or because you are exporting your data archive to another platform. Help Scout is an _email-based customer support / help desk service_.
